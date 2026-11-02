@@ -1,0 +1,13 @@
+{
+  "weights": "weights/best.pt",
+  "output": "inspection_data",
+  "confidence": 0.25,
+  "iou": 0.45,
+  "image_size": 512,
+  "device": "cpu",
+  "video_stride": 1,
+  "max_detections": 300,
+  "save_images": "all",
+  "min_free_mb": 1024,
+  "roi": null
+}

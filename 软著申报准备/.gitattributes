@@ -1,0 +1,2 @@
+# Preserve snapshot bytes so published files match the SHA-256 manifest.
+* -text

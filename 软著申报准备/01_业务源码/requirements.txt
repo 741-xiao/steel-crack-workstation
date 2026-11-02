@@ -1,0 +1,10 @@
+# ============ 钢结构裂纹检测系统 依赖 ============
+# 你的环境是 Python 3.13 + CPU，先装 CPU 版 torch（体积小、不下载 CUDA）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# 然后执行：
+#   pip install -r requirements.txt
+
+ultralytics>=8.3.0
+opencv-python>=4.10.0
+numpy>=1.26.0
+PyQt5>=5.15.10

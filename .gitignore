@@ -36,3 +36,6 @@ runs/
 !.env.example
 *.pem
 *.key
+
+# Copyright registration: keep personal details and actual screenshots local
+软著申报准备/90_本地待补材料/

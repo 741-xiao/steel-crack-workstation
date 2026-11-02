@@ -1,0 +1,1540 @@
+===== 文件：app.py =====
+"""Start the offline crack inspection workstation: python app.py."""
+
+from industrial_crack.gui import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+===== 文件：industrial.py =====
+"""Offline inspection CLI. Run with --help for supported commands."""
+
+from industrial_crack.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+===== 文件：industrial_crack/__init__.py =====
+"""Offline steel crack inspection and traceability."""
+
+__version__ = "1.0.0"
+
+===== 文件：industrial_crack/config.py =====
+"""Validated, portable inspection settings."""
+
+import json
+import math
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import Self
+
+
+@dataclass(frozen=True)
+class InspectionConfig:
+    """Parameters saved with every inspection run; paths resolve beside the config."""
+
+    weights: str = "runs/detect/steel_crack_detect_v8n_0808_1850/weights/best.pt"
+    output: str = "inspection_data"
+    confidence: float = 0.25
+    iou: float = 0.45
+    image_size: int = 512
+    device: str = "cpu"
+    video_stride: int = 1
+    max_detections: int = 300
+    save_images: str = "all"
+    min_free_mb: int = 1024
+    # Pixel coordinates [left, top, right, bottom]; null means the whole frame.
+    roi: tuple[int, int, int, int] | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("weights", "output", "device"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} 必须是非空字符串")
+        for name in ("confidence", "iou"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or not 0 < value <= 1
+            ):
+                raise ValueError(f"{name} 必须大于 0 且不超过 1")
+        for name in ("image_size", "video_stride", "max_detections", "min_free_mb"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} 必须是正整数")
+        if self.image_size % 32 or self.image_size > 4096:
+            raise ValueError("image_size 必须是 32 的倍数且不超过 4096")
+        if self.save_images not in ("all", "defects", "none"):
+            raise ValueError("save_images 必须是 all/defects/none")
+        if self.roi is not None:
+            if (
+                not isinstance(self.roi, (tuple, list))
+                or len(self.roi) != 4
+                or any(type(v) is not int for v in self.roi)
+            ):
+                raise ValueError("ROI 必须是四个整数")
+            x1, y1, x2, y2 = self.roi
+            if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                raise ValueError("ROI 必须为有效的非负矩形")
+            object.__setattr__(self, "roi", tuple(self.roi))
+
+    def to_dict(self) -> dict[str, object]:
+        """Return settings suitable for JSON persistence."""
+        return asdict(self)
+
+    @classmethod
+    def load(cls, path: Path) -> Self:
+        """Read settings and resolve relative paths against their config file."""
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(raw, dict):
+            raise TypeError("配置必须是 JSON 对象")
+        unknown = set(raw) - {f.name for f in fields(cls)}
+        if unknown:
+            raise ValueError(f"未知配置项：{', '.join(sorted(unknown))}")
+        cfg = cls(**raw)
+        resolved = cfg.to_dict()
+        for key in ("weights", "output"):
+            candidate = Path(str(resolved[key])).expanduser()
+            resolved[key] = str((path.resolve().parent / candidate).resolve())
+        return cls(**resolved)  # type: ignore[arg-type]
+
+===== 文件：industrial_crack/gui.py =====
+"""Responsive offline UI; inference and persistence run in a worker thread."""
+
+# Qt entry points report operational failures to users instead of aborting Qt.
+# ruff: noqa: BLE001
+
+import json
+import os
+import sys
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from threading import Event
+from time import monotonic
+from typing import cast
+
+# isort: off
+import torch  # noqa: F401  # Windows: load PyTorch DLLs before importing PyQt5.
+import cv2
+import numpy as np
+import PyQt5
+
+# isort: on
+from PyQt5.QtCore import QCoreApplication, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .cli import DEFAULT_CONFIG, configure_logging
+from .config import InspectionConfig
+from .review import export_review_bundle
+from .service import Image, InspectionEvent, RunSummary, inspect_batch
+from .storage import REVIEW_LABELS, InspectionStore
+
+STATUS_LABELS = {
+    "DEFECT": "疑似裂缝",
+    "NO_DETECTION": "未检出（不代表合格）",
+    "ERROR": "处理失败",
+    "RUNNING": "进行中 / 中断后未结束",
+    "FAILED": "失败",
+    "CANCELLED": "已停止",
+    "COMPLETED": "已完成",
+    "COMPLETED_WITH_ERRORS": "已完成（存在失败项）",
+}
+
+
+class InspectionWorker(QThread):
+    """Publish previews at no more than five per second."""
+
+    preview = pyqtSignal(object, int, int, int)
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, config: InspectionConfig, source: Path, batch: str) -> None:
+        super().__init__()
+        self.config, self.source, self.batch = config, source, batch
+        self.stop_event = Event()
+
+    def run(self) -> None:
+        processed = defects = errors = 0
+        last_preview = 0.0
+
+        def report(event: InspectionEvent) -> None:
+            nonlocal processed, defects, errors, last_preview
+            processed += event.record["status"] != "ERROR"
+            defects += event.record["status"] == "DEFECT"
+            errors += event.record["status"] == "ERROR"
+            if monotonic() - last_preview >= 0.2:
+                self.preview.emit(event, processed, defects, errors)
+                last_preview = monotonic()
+
+        try:
+            self.completed.emit(
+                inspect_batch(
+                    self.config, self.source, self.batch, self.stop_event, report
+                )
+            )
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
+class CrackApp(QMainWindow):
+    """Inspect batches, review recent outcomes and export persisted evidence."""
+
+    def __init__(self, config_path: Path = DEFAULT_CONFIG) -> None:
+        super().__init__()
+        self.config = InspectionConfig.load(config_path)
+        configure_logging(Path(self.config.output))
+        self.worker: InspectionWorker | None = None
+        self.close_pending = False
+        self.setWindowTitle("工业裂缝检测离线版 V1.0")
+        self.selected_record: dict[str, object] | None = None
+        self.resize(1260, 850)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.addWidget(
+            QLabel("离线检测与结果追溯  |  未检出不代表产品合格，检测结果需复核")
+        )
+        form = QFormLayout()
+        self.weights = QLineEdit(self.config.weights)
+        self.source = QLineEdit()
+        self.batch = QLineEdit(datetime.now().strftime("批次_%Y%m%d_%H%M%S"))
+        self.confidence = QDoubleSpinBox()
+        self.confidence.setRange(0.01, 1.0)
+        self.confidence.setSingleStep(0.05)
+        self.confidence.setValue(self.config.confidence)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.weights)
+        self.model_button = QPushButton("选择模型")
+        self.model_button.clicked.connect(self.choose_model)
+        model_row.addWidget(self.model_button)
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.source)
+        self.file_button = QPushButton("选择图片 / 视频")
+        self.folder_button = QPushButton("选择文件夹")
+        self.file_button.clicked.connect(self.choose_file)
+        self.folder_button.clicked.connect(self.choose_folder)
+        source_row.addWidget(self.file_button)
+        source_row.addWidget(self.folder_button)
+        form.addRow("本地模型", model_row)
+        form.addRow("检测输入", source_row)
+        form.addRow("批次 / 工件编号", self.batch)
+        form.addRow("置信度阈值", self.confidence)
+        layout.addLayout(form)
+        controls = QHBoxLayout()
+        self.start_button = QPushButton("开始检测")
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setEnabled(False)
+        self.start_button.clicked.connect(self.start_inspection)
+        self.stop_button.clicked.connect(self.stop_inspection)
+        self.status = QLabel("就绪")
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.stop_button)
+        controls.addWidget(self.status, 1)
+        layout.addLayout(controls)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.image = QLabel("选择图片、视频或文件夹后开始检测")
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setMinimumSize(480, 320)
+        self.image.setStyleSheet(
+            "background:#18212b; color:#e0e6ed; border:1px solid #405269"
+        )
+        splitter.addWidget(self.image)
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setPlaceholderText("点击历史记录，查看检测详情、坐标与错误原因")
+        splitter.addWidget(self.details)
+        splitter.setSizes([850, 350])
+        layout.addWidget(splitter, 1)
+        history_controls = QHBoxLayout()
+        history_controls.addWidget(QLabel("历史记录（最近 200 条）"))
+        self.run_filter = QComboBox()
+        self.run_filter.setMinimumWidth(180)
+        self.run_filter.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.run_filter.currentIndexChanged.connect(self.refresh_records)
+        history_controls.addWidget(self.run_filter, 1)
+        refresh = QPushButton("刷新历史")
+        refresh.clicked.connect(self.refresh_history)
+        self.export_button = QPushButton("导出 CSV")
+        self.export_button.clicked.connect(self.export_csv)
+        history_controls.addWidget(refresh)
+        history_controls.addWidget(self.export_button)
+        layout.addLayout(history_controls)
+        review_controls = QHBoxLayout()
+        review_controls.addWidget(QLabel("复核筛选"))
+        self.review_filter = QComboBox()
+        self.review_filter.addItem("全部复核状态", None)
+        for decision, label in REVIEW_LABELS.items():
+            self.review_filter.addItem(label, decision)
+        self.review_filter.currentIndexChanged.connect(self.refresh_records)
+        review_controls.addWidget(self.review_filter)
+        self.original_view = QCheckBox("查看原图（便于复核）")
+        self.original_view.toggled.connect(self.show_record)
+        review_controls.addWidget(self.original_view)
+        self.bundle_button = QPushButton("导出复核样本 ZIP")
+        self.bundle_button.clicked.connect(self.export_bundle)
+        review_controls.addWidget(self.bundle_button)
+        review_controls.addStretch()
+        layout.addLayout(review_controls)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "时间 (UTC)",
+                "批次",
+                "文件 / 帧",
+                "机器结果",
+                "预测框数",
+                "推理耗时 ms",
+                "人工复核",
+            ]
+        )
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = self.table.horizontalHeader()
+        assert header is not None
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.itemSelectionChanged.connect(self.show_record)
+        self.table.setMinimumHeight(220)
+        layout.addWidget(self.table)
+        review_form = QFormLayout()
+        self.reviewer = QLineEdit()
+        self.reviewer.setMaxLength(80)
+        self.reviewer.setPlaceholderText("填写实际复核人姓名（手工记录）")
+        self.review_decision = QComboBox()
+        self.review_decision.addItem("请选择整张图片的复核结论", None)
+        for decision, label in REVIEW_LABELS.items():
+            if decision != "PENDING":
+                self.review_decision.addItem(label, decision)
+        reviewer_row = QHBoxLayout()
+        reviewer_row.addWidget(self.reviewer)
+        reviewer_row.addWidget(self.review_decision)
+        self.review_save = QPushButton("保存人工复核")
+        self.review_save.setEnabled(False)
+        self.review_save.clicked.connect(self.save_review)
+        reviewer_row.addWidget(self.review_save)
+        review_form.addRow("人工复核", reviewer_row)
+        self.review_note = QLineEdit()
+        self.review_note.setMaxLength(2000)
+        self.review_note.setPlaceholderText(
+            "必填：复核依据；有裂缝不代表所有预测框正确，无裂缝不等于工件合格"
+        )
+        review_form.addRow("复核依据", self.review_note)
+        layout.addLayout(review_form)
+        layout.addWidget(
+            QLabel(
+                f"结果目录：{self.config.output}  |  保存策略：{self.config.save_images}"
+            )
+        )
+        self.refresh_history()
+        self.timer = QTimer(self)
+        self.timer.setInterval(1500)
+        self.timer.timeout.connect(self.refresh_records)
+
+    def choose_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择可信的本地裂缝模型", "", "模型 (*.pt *.onnx)"
+        )
+        if path:
+            self.weights.setText(path)
+
+    def choose_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图片或视频",
+            "",
+            "图片或视频 (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff *.mp4 *.avi *.mov *.mkv *.m4v)",
+        )
+        if path:
+            self.source.setText(path)
+
+    def choose_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择批量检测目录")
+        if path:
+            self.source.setText(path)
+
+    def start_inspection(self) -> None:
+        if self.worker is not None:
+            return
+        try:
+            if not self.source.text().strip() or not Path(self.source.text()).exists():
+                raise ValueError("请选择存在的输入文件或文件夹")
+            if not self.batch.text().strip():
+                raise ValueError("请输入批次或工件编号")
+            if not Path(self.weights.text()).is_file():
+                raise ValueError("请选择存在的本地模型文件")
+            config = replace(
+                self.config,
+                weights=str(Path(self.weights.text()).resolve()),
+                confidence=self.confidence.value(),
+            )
+            self.worker = InspectionWorker(
+                config, Path(self.source.text()), self.batch.text().strip()
+            )
+            self.worker.preview.connect(self.update_preview)
+            self.worker.completed.connect(self.on_completed)
+            self.worker.failed.connect(self.on_failed)
+            self.worker.finished.connect(self.on_finished)
+            self.set_busy(True)
+            self.status.setText("正在加载模型并准备检测…")
+            self.worker.start()
+            self.timer.start()
+        except Exception as error:
+            QMessageBox.warning(self, "无法开始", str(error))
+
+    def set_busy(self, busy: bool) -> None:
+        for widget in (
+            self.weights,
+            self.source,
+            self.batch,
+            self.confidence,
+            self.model_button,
+            self.file_button,
+            self.folder_button,
+            self.start_button,
+            self.export_button,
+            self.bundle_button,
+            self.reviewer,
+            self.review_decision,
+            self.review_note,
+            self.table,
+        ):
+            widget.setEnabled(not busy)
+        self.review_save.setEnabled(
+            not busy
+            and self.selected_record is not None
+            and self.selected_record["status"] != "ERROR"
+        )
+        self.stop_button.setEnabled(busy)
+
+    def stop_inspection(self) -> None:
+        if self.worker is not None:
+            self.worker.stop_event.set()
+            self.status.setText("正在停止，等待当前帧和结果保存完成…")
+            self.stop_button.setEnabled(False)
+
+    def update_preview(
+        self, event: InspectionEvent, processed: int, defects: int, errors: int
+    ) -> None:
+        self.status.setText(
+            f"已检测 {processed} 张/帧 · 疑似裂缝 {defects} 张/帧 · 失败 {errors}"
+        )
+        if event.preview is not None:
+            self.show_image(event.preview)
+
+    def show_image(self, image: Image) -> None:
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        height, width = rgb.shape[:2]
+        qimage = QImage(
+            rgb.tobytes(), width, height, int(rgb.strides[0]), QImage.Format_RGB888
+        ).copy()
+        self.image.setPixmap(
+            QPixmap.fromImage(qimage).scaled(
+                self.image.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def on_completed(self, summary: RunSummary) -> None:
+        self.status.setText(
+            f"{STATUS_LABELS[summary.status]} · {summary.processed} 张/帧 · 疑似裂缝 {summary.defects} · 失败 {summary.errors}"
+        )
+
+    def on_failed(self, error: str) -> None:
+        self.status.setText(f"检测失败：{error}")
+        if not self.close_pending:
+            QMessageBox.critical(self, "检测已停止", error)
+
+    def on_finished(self) -> None:
+        assert self.worker is not None
+        self.worker.deleteLater()
+        self.worker = None
+        self.timer.stop()
+        self.set_busy(False)
+        self.refresh_history()
+        if self.close_pending:
+            self.close()
+
+    def refresh_history(self) -> None:
+        try:
+            selected = self.run_filter.currentData()
+            with InspectionStore(Path(self.config.output)) as store:
+                runs = store.runs()
+            self.run_filter.blockSignals(True)
+            self.run_filter.clear()
+            self.run_filter.addItem("全部批次", None)
+            for run in runs:
+                label = f"{run['batch']} | {run['started_at']} | {STATUS_LABELS.get(str(run['status']), str(run['status']))} | {str(run['id'])[:8]}"
+                self.run_filter.addItem(label, run["id"])
+            self.run_filter.setCurrentIndex(max(0, self.run_filter.findData(selected)))
+            self.run_filter.blockSignals(False)
+            self.refresh_records()
+        except Exception as error:
+            self.status.setText(f"历史读取失败：{error}")
+
+    def refresh_records(self) -> None:
+        try:
+            with InspectionStore(Path(self.config.output)) as store:
+                records = store.history(
+                    self.run_filter.currentData(),
+                    review_decision=self.review_filter.currentData(),
+                )
+            self.selected_record = None
+            self.review_save.setEnabled(False)
+            self.review_decision.setCurrentIndex(0)
+            self.review_note.clear()
+            self.details.clear()
+            if self.worker is None:
+                self.image.clear()
+                self.image.setText("点击历史记录查看图片并复核")
+            self.table.setRowCount(0)
+            for row, record in enumerate(records):
+                self.table.insertRow(row)
+                frame = (
+                    f" / 帧 {record['frame_index']}"
+                    if record["frame_index"] is not None
+                    else ""
+                )
+                values = [
+                    record["created_at"],
+                    record["batch"],
+                    Path(str(record["source"])).name + frame,
+                    STATUS_LABELS[str(record["status"])],
+                    len(json.loads(str(record["detections_json"]))),
+                    record["elapsed_ms"],
+                    REVIEW_LABELS[str(record["review_decision"])],
+                ]
+                for column, value in enumerate(values):
+                    cell = QTableWidgetItem(str(value))
+                    cell.setData(Qt.ItemDataRole.UserRole, record)
+                    self.table.setItem(row, column, cell)
+        except Exception as error:
+            self.status.setText(f"历史读取失败：{error}")
+
+    def show_record(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+        record = selected[0].data(Qt.ItemDataRole.UserRole)
+        changed = (
+            self.selected_record is None or self.selected_record["id"] != record["id"]
+        )
+        self.selected_record = record
+        self.review_save.setEnabled(self.worker is None and record["status"] != "ERROR")
+        if changed:
+            self.review_decision.setCurrentIndex(
+                max(0, self.review_decision.findData(record["review_decision"]))
+            )
+            self.review_note.setText(str(record["review_note"]))
+        with InspectionStore(Path(self.config.output)) as store:
+            run = store.connection.execute(
+                "SELECT * FROM runs WHERE id=?", (record["run_id"],)
+            ).fetchone()
+            revisions = store.review_history(str(record["id"]))
+        details = dict(record)
+        details["review_history"] = revisions
+        details["detections"] = json.loads(details.pop("detections_json"))
+        if run is not None:
+            details["model_sha256"] = run["model_sha256"]
+            details["settings"] = json.loads(run["config_json"])
+        self.details.setPlainText(json.dumps(details, ensure_ascii=False, indent=2))
+        path = (
+            record.get("original_path")
+            if self.original_view.isChecked()
+            else record.get("annotated_path") or record.get("original_path")
+        )
+        try:
+            image = (
+                cv2.imdecode(
+                    np.fromfile(Path(self.config.output) / path, dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+                if path
+                else None
+            )
+            if image is not None:
+                self.show_image(cast(Image, image))
+            else:
+                self.image.clear()
+                self.image.setText("该记录没有保存图片；请查看详情")
+        except (OSError, cv2.error) as error:
+            self.image.clear()
+            self.image.setText(f"历史图片无法读取：{error}")
+
+    def export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出当前筛选的全部记录", "检测记录.csv", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with InspectionStore(Path(self.config.output)) as store:
+                count = store.export_csv(
+                    Path(path),
+                    self.run_filter.currentData(),
+                    self.review_filter.currentData(),
+                )
+            self.status.setText(f"已导出 {count} 条记录：{path}")
+        except Exception as error:
+            QMessageBox.critical(self, "导出失败", str(error))
+
+    def save_review(self) -> None:
+        """Append a human decision against the exact version displayed to the user."""
+        record = self.selected_record
+        if record is None or self.worker is not None:
+            return
+        try:
+            with InspectionStore(Path(self.config.output)) as store:
+                store.add_review(
+                    str(record["id"]),
+                    self.review_decision.currentData(),
+                    self.reviewer.text(),
+                    self.review_note.text(),
+                    int(record["review_version"]),
+                )
+            self.refresh_records()
+            self.status.setText("人工复核已保存；机器预测保留，可在详情中查看历次复核")
+        except Exception as error:
+            QMessageBox.warning(self, "复核未保存", str(error))
+
+    def export_bundle(self) -> None:
+        """Export reviewed evidence under the current filters for later annotation."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出当前筛选的已复核样本", "复核样本.zip", "ZIP (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            summary = export_review_bundle(
+                Path(self.config.output),
+                Path(path),
+                self.run_filter.currentData(),
+                self.review_filter.currentData(),
+            )
+            self.status.setText(
+                f"已导出 {summary['records']} 条复核，{summary['images']} 张原图；"
+                f"缺少原图 {summary['missing_images']} 条。需人工标注后才能训练。"
+            )
+        except Exception as error:
+            QMessageBox.warning(self, "样本导出失败", str(error))
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        if event is None:
+            return
+        if self.worker is not None:
+            self.close_pending = True
+            self.stop_inspection()
+            event.ignore()
+        else:
+            event.accept()
+
+
+def main() -> int:
+    """Launch the workstation using settings adjacent to the application."""
+    plugin_dir = Path(PyQt5.__file__).resolve().parent / "Qt5" / "plugins"
+    platform_plugin = plugin_dir / "platforms" / "qwindows.dll"
+    if not platform_plugin.is_file():
+        QMessageBox.critical(
+            None,
+            "工作站启动失败",
+            f"未找到 Qt Windows 界面插件：{platform_plugin}\n请修复当前 Python 环境中的 PyQt5 安装。",
+        )
+        return 1
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platform_plugin.parent)
+    QCoreApplication.addLibraryPath(str(plugin_dir))
+    app = QApplication(sys.argv)
+    try:
+        window = CrackApp()
+    except Exception as error:
+        QMessageBox.critical(None, "工作站启动失败", str(error))
+        return 1
+    window.show()
+    return int(app.exec_())
+
+===== 文件：industrial_crack/service.py =====
+"""Bounded-memory offline inspection with cooperative cancellation."""
+
+import hashlib
+import importlib.metadata
+import logging
+import platform
+import shutil
+from collections.abc import Callable, Generator, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Event
+from time import perf_counter
+from typing import Any, cast
+
+import cv2
+import numpy as np
+from numpy.typing import NDArray
+
+from . import __version__
+from .config import InspectionConfig
+from .storage import InspectionStore
+
+Image = NDArray[np.uint8]
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class InspectionEvent:
+    """An already committed result and optional preview for the caller."""
+
+    record: dict[str, object]
+    preview: Image | None
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """Run-level outcome; no detections never implies product acceptance."""
+
+    run_id: str
+    status: str
+    processed: int
+    defects: int
+    errors: int
+
+
+def sha256_file(path: Path) -> str:
+    """Hash local weights without loading them entirely into memory."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def encode_png(image: Image) -> bytes:
+    """Losslessly encode a decoded original or annotated image."""
+    success, encoded = cv2.imencode(".png", image)
+    if not success:
+        raise OSError("图像编码失败")
+    return bytes(encoded)
+
+
+def sources(path: Path) -> Iterator[Path]:
+    """Enumerate supported inputs deterministically, excluding output by caller."""
+    path = path.resolve()
+    if path.is_dir():
+        found = False
+        for item in sorted(path.rglob("*")):
+            if (
+                item.is_file()
+                and item.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            ):
+                found = True
+                yield item
+        if not found:
+            raise ValueError("目录中没有支持的图片或视频")
+    elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS:
+        yield path
+    else:
+        raise ValueError(f"输入不存在或格式不支持：{path}")
+
+
+def read_frames(
+    path: Path, stride: int, stop: Event
+) -> Generator[tuple[int | None, Image, str]]:
+    """Read Unicode image paths or video frames; retain at most one decoded frame."""
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        raw = path.read_bytes()
+        image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("图片无法解码")
+        yield None, cast(Image, image), hashlib.sha256(raw).hexdigest()
+        return
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise ValueError("视频无法打开")
+        expected = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        index = 0
+        while not stop.is_set():
+            success, image = capture.read()
+            if not success:
+                if index == 0 or (expected > 0 and index < expected):
+                    raise ValueError(
+                        f"视频提前结束或解码失败：已读 {index} / {expected} 帧"
+                    )
+                break
+            if index % stride == 0:
+                yield index, cast(Image, image), hashlib.sha256(
+                    image.tobytes()
+                ).hexdigest()
+            index += 1
+    finally:
+        capture.release()
+
+
+def infer(
+    model: Any, image: Image, config: InspectionConfig
+) -> tuple[list[dict[str, object]], Image]:
+    """Predict a frame or ROI; all stored coordinates refer to the original frame."""
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = config.roi or (0, 0, width, height)
+    if x2 > width or y2 > height:
+        raise ValueError(f"ROI 超出图片范围 {width}×{height}")
+    result = model.predict(
+        source=image[y1:y2, x1:x2],
+        conf=config.confidence,
+        iou=config.iou,
+        imgsz=config.image_size,
+        device=config.device,
+        max_det=config.max_detections,
+        verbose=False,
+        save=False,
+    )[0]
+    detections: list[dict[str, object]] = []
+    if result.boxes is not None:
+        boxes = result.boxes.xyxy.cpu().tolist()
+        confidences = result.boxes.conf.cpu().tolist()
+        classes = result.boxes.cls.cpu().tolist()
+        masks = result.masks.xy if result.masks is not None else None
+        for index, (box, confidence, class_id) in enumerate(
+            zip(boxes, confidences, classes, strict=True)
+        ):
+            detection: dict[str, object] = {
+                "class_id": int(class_id),
+                "class_name": str(result.names[int(class_id)]),
+                "confidence": float(confidence),
+                "xyxy": [
+                    float(box[0] + x1),
+                    float(box[1] + y1),
+                    float(box[2] + x1),
+                    float(box[3] + y1),
+                ],
+            }
+            if masks is not None:
+                detection["polygon"] = (masks[index] + np.array([x1, y1])).tolist()
+            detections.append(detection)
+    annotated = image.copy()
+    annotated[y1:y2, x1:x2] = result.plot()
+    if config.roi:
+        cv2.rectangle(annotated, (x1, y1), (x2 - 1, y2 - 1), (0, 180, 255), 1)
+    return detections, annotated
+
+
+def inspect_batch(
+    config: InspectionConfig,
+    source: Path,
+    batch: str,
+    stop: Event | None = None,
+    callback: Callable[[InspectionEvent], None] | None = None,
+    model_factory: Callable[[str], Any] | None = None,
+) -> RunSummary:
+    """Inspect local inputs and durably record every outcome before notifying UI.
+
+    Input/model errors are recorded; storage failures abort the run. Cancellation
+    takes effect between frames, never through an unsafe thread termination.
+    """
+    stop = stop if stop is not None else Event()
+    weights, output, source = (
+        Path(config.weights).resolve(),
+        Path(config.output).resolve(),
+        source.resolve(),
+    )
+    if not weights.is_file():
+        raise FileNotFoundError(f"找不到本地模型：{weights}")
+    if (
+        source == output
+        or output in source.parents
+        or (source.is_dir() and source in output.parents)
+    ):
+        raise ValueError("输入目录与结果目录不能相互包含，以防再次检测输出图片")
+    if not source.exists():
+        raise FileNotFoundError(f"输入不存在：{source}")
+    if not batch.strip():
+        raise ValueError("批次名称不能为空")
+    model_hash = sha256_file(weights)
+    versions = {
+        "app": __version__,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+    }
+    for package in ("ultralytics", "torch", "opencv-python", "numpy"):
+        versions[package] = importlib.metadata.version(package)
+    processed = defects = errors = 0
+    with InspectionStore(output) as store:
+        run_id = store.begin(batch, model_hash, config.to_dict(), versions)
+        try:
+
+            def check_space() -> None:
+                if shutil.disk_usage(output).free < config.min_free_mb * 1024 * 1024:
+                    raise OSError("结果磁盘剩余空间低于配置下限，检测已停止")
+
+            check_space()
+            if model_factory is None:
+                from ultralytics import YOLO  # type: ignore[attr-defined]
+
+                model_factory = YOLO
+            model = model_factory(str(weights))
+            if sha256_file(weights) != model_hash:
+                raise RuntimeError("模型在加载过程中发生改变，请停止修改模型后重试")
+            if getattr(model, "task", "detect") not in ("detect", "segment"):
+                raise ValueError("仅支持 YOLO 检测或分割模型")
+            # This application is dedicated to single-class crack models.
+            if len(model.names) != 1 or str(model.names[0]).lower() != "crack":
+                raise ValueError("请选择仅包含 crack 类别的钢结构裂缝模型")
+            for item in sources(source):
+                if stop.is_set():
+                    break
+                frames = read_frames(item, config.video_stride, stop)
+                video_hash = (
+                    sha256_file(item)
+                    if item.suffix.lower() in VIDEO_EXTENSIONS
+                    else None
+                )
+                frame_index: int | None = None
+                try:
+                    while not stop.is_set():
+                        try:
+                            frame_index, original, frame_hash = next(frames)
+                        except StopIteration:
+                            break
+                        source_hash = video_hash or frame_hash
+                        started = perf_counter()
+                        detections, annotated = infer(model, original, config)
+                        elapsed = (perf_counter() - started) * 1000
+                        status = "DEFECT" if detections else "NO_DETECTION"
+                        check_space()
+                        save = config.save_images == "all" or (
+                            config.save_images == "defects" and bool(detections)
+                        )
+                        # Store/encoding failures must escape the input-error handler.
+                        try:
+                            row = store.record(
+                                run_id,
+                                str(item),
+                                frame_index,
+                                source_hash,
+                                status,
+                                detections,
+                                elapsed,
+                                encode_png(original) if save else None,
+                                encode_png(annotated) if save else None,
+                            )
+                        except Exception as error:
+                            raise StorageError(str(error)) from error
+                        processed += 1
+                        defects += bool(detections)
+                        if callback:
+                            callback(InspectionEvent(row, annotated))
+                except (StorageError, OSError):
+                    raise
+                except Exception as error:
+                    LOGGER.exception("输入处理失败：%s", item)
+                    errors += 1
+                    row = store.record(
+                        run_id,
+                        str(item),
+                        frame_index,
+                        "",
+                        "ERROR",
+                        [],
+                        0,
+                        error=str(error),
+                    )
+                    if callback:
+                        callback(InspectionEvent(row, None))
+                finally:
+                    frames.close()
+            status = (
+                "CANCELLED"
+                if stop.is_set()
+                else "COMPLETED_WITH_ERRORS" if errors else "COMPLETED"
+            )
+            store.finish(run_id, status)
+            return RunSummary(run_id, status, processed, defects, errors)
+        except Exception as error:
+            store.finish(run_id, "FAILED", str(error))
+            raise
+
+
+class StorageError(RuntimeError):
+    """A persistence error that must stop inspection rather than discard evidence."""
+
+===== 文件：industrial_crack/storage.py =====
+"""SQLite run history, atomic image files and spreadsheet-safe CSV exports."""
+
+import csv
+import json
+import os
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
+from types import TracebackType
+from typing import Self
+from uuid import uuid4
+
+REVIEW_LABELS = {
+    "PENDING": "未复核",
+    "CONFIRMED": "人工确认有裂缝",
+    "CLEAR": "人工确认无裂缝",
+    "UNCERTAIN": "待进一步复查",
+}
+
+# Keep machine outcomes immutable; the latest human opinion is a separate view.
+HISTORY_QUERY = """
+    SELECT inspections.*, runs.batch,
+        COALESCE(reviews.id, 0) AS review_version,
+        COALESCE(reviews.decision, 'PENDING') AS review_decision,
+        COALESCE(reviews.reviewer, '') AS reviewer,
+        COALESCE(reviews.note, '') AS review_note,
+        COALESCE(reviews.created_at, '') AS reviewed_at
+    FROM inspections JOIN runs ON runs.id=inspections.run_id
+    LEFT JOIN reviews ON reviews.id=(
+        SELECT MAX(r.id) FROM reviews r WHERE r.inspection_id=inspections.id
+    )
+"""
+
+
+def utc_now() -> str:
+    """Use unambiguous UTC timestamps in persisted records."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    """Commit a file using a same-directory atomic rename."""
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class InspectionStore:
+    """One connection per worker; images are written before their database row."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(self.root / "inspections.sqlite3", timeout=10)
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=FULL")
+        self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.executescript("""
+            CREATE TABLE IF NOT EXISTS runs (
+                id TEXT PRIMARY KEY, batch TEXT NOT NULL, started_at TEXT NOT NULL,
+                finished_at TEXT, status TEXT NOT NULL, model_sha256 TEXT NOT NULL,
+                config_json TEXT NOT NULL, environment_json TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS inspections (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+                created_at TEXT NOT NULL, source TEXT NOT NULL, frame_index INTEGER,
+                source_sha256 TEXT NOT NULL, status TEXT NOT NULL,
+                detections_json TEXT NOT NULL, elapsed_ms REAL NOT NULL,
+                original_path TEXT, annotated_path TEXT, error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS inspections_run ON inspections(run_id);
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inspection_id TEXT NOT NULL REFERENCES inspections(id),
+                created_at TEXT NOT NULL, reviewer TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('CONFIRMED','CLEAR','UNCERTAIN')),
+                note TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS reviews_inspection ON reviews(inspection_id, id);
+        """)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.connection.close()
+
+    def begin(
+        self,
+        batch: str,
+        model_sha256: str,
+        config: dict[str, object],
+        environment: dict[str, str],
+    ) -> str:
+        """Persist provenance before the first inference."""
+        run_id = uuid4().hex
+        (self.root / run_id).mkdir()
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO runs VALUES (?,?,?,NULL,'RUNNING',?,?,?,'')",
+                (
+                    run_id,
+                    batch,
+                    utc_now(),
+                    model_sha256,
+                    json.dumps(config, ensure_ascii=False),
+                    json.dumps(environment),
+                ),
+            )
+        return run_id
+
+    def finish(self, run_id: str, status: str, error: str = "") -> None:
+        """Close a run, preserving ERROR/CANCELLED independently of detections."""
+        with self.connection:
+            self.connection.execute(
+                "UPDATE runs SET finished_at=?,status=?,error=? WHERE id=?",
+                (utc_now(), status, error, run_id),
+            )
+
+    def record(
+        self,
+        run_id: str,
+        source: str,
+        frame_index: int | None,
+        source_sha256: str,
+        status: str,
+        detections: list[dict[str, object]],
+        elapsed_ms: float,
+        original: bytes | None = None,
+        annotated: bytes | None = None,
+        error: str = "",
+    ) -> dict[str, object]:
+        """Store one outcome; failures propagate so a run cannot silently succeed."""
+        inspection_id = uuid4().hex
+        paths: list[str | None] = [None, None]
+        created: list[Path] = []
+        try:
+            for i, (suffix, data) in enumerate(
+                (("original", original), ("annotated", annotated))
+            ):
+                if data is not None:
+                    relative = Path(run_id) / f"{inspection_id}_{suffix}.png"
+                    destination = self.root / relative
+                    atomic_write(destination, data)
+                    created.append(destination)
+                    paths[i] = relative.as_posix()
+            row: dict[str, object] = {
+                "id": inspection_id,
+                "run_id": run_id,
+                "created_at": utc_now(),
+                "source": source,
+                "frame_index": frame_index,
+                "source_sha256": source_sha256,
+                "status": status,
+                "detections_json": json.dumps(
+                    detections, ensure_ascii=False, allow_nan=False
+                ),
+                "elapsed_ms": round(elapsed_ms, 3),
+                "original_path": paths[0],
+                "annotated_path": paths[1],
+                "error": error,
+            }
+            with self.connection:
+                self.connection.execute(
+                    "INSERT INTO inspections VALUES (:id,:run_id,:created_at,:source,"
+                    ":frame_index,:source_sha256,:status,:detections_json,:elapsed_ms,"
+                    ":original_path,:annotated_path,:error)",
+                    row,
+                )
+            return row
+        except Exception:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+
+    def history(
+        self,
+        run_id: str | None = None,
+        limit: int = 200,
+        review_decision: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Return recent outcomes, optionally restricted to a batch run."""
+        query, params = self.result_query(run_id, review_decision)
+        rows = self.connection.execute(
+            query + " ORDER BY inspections.rowid DESC LIMIT ?", (*params, limit)
+        )
+        return [dict(row) for row in rows]
+
+    def result_query(
+        self, run_id: str | None = None, review_decision: str | None = None
+    ) -> tuple[str, tuple[object, ...]]:
+        """Build the shared history/export filter; reject unknown review states."""
+        clauses, params = [], []
+        if run_id:
+            clauses.append("inspections.run_id=?")
+            params.append(run_id)
+        if review_decision is not None:
+            if review_decision not in REVIEW_LABELS:
+                raise ValueError("未知复核状态")
+            clauses.append("COALESCE(reviews.decision, 'PENDING')=?")
+            params.append(review_decision)
+        return HISTORY_QUERY + (
+            " WHERE " + " AND ".join(clauses) if clauses else ""
+        ), tuple(params)
+
+    def review_history(self, inspection_id: str) -> list[dict[str, object]]:
+        """Return every human revision in commit order, including superseded ones."""
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM reviews WHERE inspection_id=? ORDER BY id",
+                (inspection_id,),
+            )
+        ]
+
+    def add_review(
+        self,
+        inspection_id: str,
+        decision: str,
+        reviewer: str,
+        note: str,
+        expected_version: int,
+    ) -> int:
+        """Append a review without changing predictions.
+
+        Args:
+            inspection_id: Persisted image/frame ID.
+            decision: CONFIRMED, CLEAR or UNCERTAIN; applies to the entire image.
+            reviewer: Operator-entered name (not an authenticated identity).
+            note: Required explanation, up to 2000 characters.
+            expected_version: Latest review ID seen by the caller, or zero.
+
+        Returns:
+            The new review ID.
+
+        Raises:
+            ValueError: Invalid fields, missing inspection or failed inspection.
+            RuntimeError: Another reviewer has already changed this record.
+        """
+        if decision not in REVIEW_LABELS or decision == "PENDING":
+            raise ValueError("请选择有效的复核结论")
+        reviewer, note = reviewer.strip(), note.strip()
+        if not reviewer or len(reviewer) > 80:
+            raise ValueError("复核人必填，最多 80 字")
+        if not note or len(note) > 2000:
+            raise ValueError("复核依据必填，最多 2000 字")
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("复核版本无效")
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            record = self.connection.execute(
+                "SELECT status FROM inspections WHERE id=?", (inspection_id,)
+            ).fetchone()
+            if record is None or record["status"] == "ERROR":
+                raise ValueError("记录不存在或处理失败；请先重新检测")
+            version = self.connection.execute(
+                "SELECT COALESCE(MAX(id),0) FROM reviews WHERE inspection_id=?",
+                (inspection_id,),
+            ).fetchone()[0]
+            if version != expected_version:
+                raise RuntimeError("该记录已有新的复核，请刷新后查看再提交")
+            cursor = self.connection.execute(
+                "INSERT INTO reviews (inspection_id,created_at,reviewer,decision,note) VALUES (?,?,?,?,?)",
+                (inspection_id, utc_now(), reviewer, decision, note),
+            )
+            return int(cursor.lastrowid)
+
+    def runs(self, limit: int = 100) -> list[dict[str, object]]:
+        """Include unfinished runs so interrupted jobs remain visible."""
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM runs ORDER BY rowid DESC LIMIT ?", (limit,)
+            )
+        ]
+
+    def export_csv(
+        self,
+        path: Path,
+        run_id: str | None = None,
+        review_decision: str | None = None,
+    ) -> int:
+        """Stream records into an atomic UTF-8 CSV; neutralize spreadsheet formulas."""
+        query, params = self.result_query(run_id, review_decision)
+        rows = self.connection.execute(query, params)
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        count = 0
+        try:
+            with temporary.open("x", encoding="utf-8-sig", newline="") as handle:
+                assert rows.description is not None
+                writer = csv.writer(handle)
+                writer.writerow([column[0] for column in rows.description])
+                for row in rows:
+                    writer.writerow(
+                        [
+                            (
+                                "'" + value
+                                if isinstance(value, str)
+                                and value.lstrip().startswith(("=", "+", "-", "@"))
+                                else value
+                            )
+                            for value in row
+                        ]
+                    )
+                    count += 1
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return count
+
+===== 文件：industrial_crack/review.py =====
+"""Export human-reviewed evidence for later annotation, without inventing labels."""
+
+import hashlib
+import json
+from pathlib import Path
+from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from . import __version__
+from .storage import InspectionStore, utc_now
+
+
+def review_category(machine: str, decision: str) -> str:
+    """Classify image-level disagreement; this is not a box-level accuracy metric."""
+    if decision == "UNCERTAIN":
+        return "needs_recheck"
+    if machine == "NO_DETECTION" and decision == "CONFIRMED":
+        return "possible_miss"
+    if machine == "DEFECT" and decision == "CLEAR":
+        return "possible_false_alarm"
+    return "human_machine_agreement"
+
+
+def export_review_bundle(
+    root: Path,
+    path: Path,
+    run_id: str | None = None,
+    review_decision: str | None = None,
+) -> dict[str, object]:
+    """Export a consistent snapshot of reviewed records into a local ZIP.
+
+    Args:
+        root: Inspection data directory containing the SQLite database.
+        path: Destination ZIP path; parent directory must exist.
+        run_id: Optional batch run filter.
+        review_decision: Optional human decision filter matching the history UI.
+
+    Returns:
+        Counts of reviewed records, copied images and records without images.
+
+    Raises:
+        ValueError: No reviewed records match, or a stored path leaves root.
+        OSError: Evidence cannot be read or the destination cannot be written.
+
+    Missing originals are explicitly recorded. Predicted boxes remain suggestions;
+    no YOLO label files are generated. Exported PNG hashes describe the copied
+    evidence, while source_sha256 describes the original detection input.
+    """
+    root, path = root.resolve(), path.resolve()
+    if path.suffix.lower() != ".zip":
+        raise ValueError("样本包必须使用 .zip 扩展名")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    summary: dict[str, object] = {
+        "format_version": 1,
+        "app_version": __version__,
+        "created_at": utc_now(),
+        "run_id": run_id,
+        "review_filter": review_decision,
+        "records": 0,
+        "images": 0,
+        "missing_images": 0,
+        "purpose": "待人工标注样本；不能直接用于训练",
+    }
+    counts = {"records": 0, "images": 0, "missing_images": 0}
+    try:
+        with (
+            InspectionStore(root) as store,
+            ZipFile(temporary, "x", ZIP_DEFLATED) as archive,
+        ):
+            # Hold a read snapshot so latest decisions and revision lists agree.
+            store.connection.execute("BEGIN")
+            query, params = store.result_query(run_id, review_decision)
+            for row in store.connection.execute(query, params):
+                record = dict(row)
+                if record["review_decision"] == "PENDING":
+                    continue
+                counts["records"] += 1
+                record["category"] = review_category(
+                    record["status"], record["review_decision"]
+                )
+                record["review_history"] = store.review_history(record["id"])
+                run = store.connection.execute(
+                    "SELECT * FROM runs WHERE id=?", (record["run_id"],)
+                ).fetchone()
+                record["run"] = dict(run)
+                record["predictions_are_ground_truth"] = False
+                # Use numeric review ID for archive paths, never user-entered text.
+                prefix = f"samples/review_{int(record['review_version'])}"
+                original = record["original_path"]
+                evidence = (root / original).resolve() if original else None
+                if evidence is not None and not evidence.is_relative_to(root):
+                    raise ValueError("原图路径超出结果目录，导出已停止")
+                if evidence is None or not evidence.is_file():
+                    record["image_status"] = "missing_original"
+                    counts["missing_images"] += 1
+                else:
+                    digest = hashlib.sha256()
+                    with (
+                        evidence.open("rb") as source,
+                        archive.open(f"{prefix}/original.png", "w") as target,
+                    ):
+                        while chunk := source.read(1024 * 1024):
+                            digest.update(chunk)
+                            target.write(chunk)
+                    record["image_status"] = "included"
+                    record["exported_image_sha256"] = digest.hexdigest()
+                    counts["images"] += 1
+                archive.writestr(
+                    f"{prefix}/record.json",
+                    json.dumps(record, ensure_ascii=False, indent=2),
+                )
+            if not counts["records"]:
+                raise ValueError("当前筛选下没有已复核记录，请先保存人工复核")
+            summary.update(counts)
+            archive.writestr(
+                "summary.json", json.dumps(summary, ensure_ascii=False, indent=2)
+            )
+            archive.writestr(
+                "README.md",
+                (
+                    "# 人工复核样本包\n\n"
+                    "这是待标注资料，不是可直接训练的数据集。每个 samples 子目录包含复核记录，"
+                    "原图存在时同时包含 original.png。请先查看 summary.json 的 missing_images。\n\n"
+                    "record.json 保留模型预测、参数、模型/源文件指纹和全部复核历史。"
+                    "有裂缝/无裂缝结论针对整张图，不表示每个框正确或全部裂缝已标完。"
+                    "请使用标注工具检查全图并补画/修正框，完成独立复查后再用于训练。"
+                    "同一工件、连续视频帧应划入同一数据子集，避免训练与测试泄漏。\n\n"
+                    "category 是人工与机器的图像级分歧分类，不是精确率/召回率。"
+                    "仅针对 ROI 的推理不能代表全图覆盖。复核人姓名为手工输入，未经身份认证。\n"
+                ),
+            )
+        temporary.replace(path)
+        return summary
+    finally:
+        temporary.unlink(missing_ok=True)
+
+===== 文件：industrial_crack/cli.py =====
+"""Command-line inspection, history lookup and traceability export."""
+
+import argparse
+import json
+import logging
+import signal
+from dataclasses import asdict, replace
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from threading import Event
+
+from .config import InspectionConfig
+from .review import export_review_bundle
+from .service import InspectionEvent, inspect_batch
+from .storage import REVIEW_LABELS, InspectionStore
+
+DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "inspection_config.json"
+
+
+def configure_logging(root: Path) -> None:
+    """Keep bounded application logs under the configured result directory."""
+    root.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        root / "inspection.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger = logging.getLogger("industrial_crack")
+    for previous in logger.handlers[:]:
+        previous.close()
+        logger.removeHandler(previous)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run a local batch or query its durable history."""
+    parser = argparse.ArgumentParser(description="钢结构裂缝离线检测与追溯")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    inspect = subparsers.add_parser("inspect", help="检测图片、视频或文件夹")
+    inspect.add_argument("--source", type=Path, required=True)
+    inspect.add_argument("--batch", required=True, help="工件/批次名称")
+    inspect.add_argument("--weights", type=Path)
+    inspect.add_argument("--conf", type=float)
+    subparsers.add_parser("history", help="查看近期批次及参数")
+    export = subparsers.add_parser("export", help="导出 CSV")
+    export.add_argument("--file", type=Path, required=True)
+    export.add_argument("--run-id", help="省略时导出全部记录")
+    export.add_argument("--review-state", choices=list(REVIEW_LABELS))
+    samples = subparsers.add_parser("export-samples", help="导出已复核的待标注样本 ZIP")
+    samples.add_argument("--file", type=Path, required=True)
+    samples.add_argument("--run-id")
+    samples.add_argument("--review-state", choices=list(REVIEW_LABELS))
+    args = parser.parse_args(argv)
+    try:
+        config = InspectionConfig.load(args.config)
+        configure_logging(Path(config.output))
+        if args.command == "inspect":
+            if args.weights:
+                config = replace(config, weights=str(args.weights.resolve()))
+            if args.conf is not None:
+                config = replace(config, confidence=args.conf)
+            stop = Event()
+            previous = signal.signal(signal.SIGINT, lambda *_: stop.set())
+            try:
+
+                def progress(event: InspectionEvent) -> None:
+                    print(
+                        f"{event.record['status']} {event.record['source']} "
+                        f"frame={event.record['frame_index']}",
+                        flush=True,
+                    )
+
+                summary = inspect_batch(config, args.source, args.batch, stop, progress)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+            print(json.dumps(asdict(summary), ensure_ascii=False, indent=2))
+            return {"COMPLETED": 0, "CANCELLED": 130}.get(summary.status, 2)
+        if args.command == "export-samples":
+            summary = export_review_bundle(
+                Path(config.output), args.file, args.run_id, args.review_state
+            )
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            return 0
+        with InspectionStore(Path(config.output)) as store:
+            if args.command == "history":
+                print(json.dumps(store.runs(), ensure_ascii=False, indent=2))
+            else:
+                count = store.export_csv(args.file, args.run_id, args.review_state)
+                print(f"已导出 {count} 条记录：{args.file.resolve()}")
+        return 0
+    except Exception as error:
+        logging.getLogger(__name__).exception("操作失败")
+        print(f"操作失败：{error}")
+        return 1

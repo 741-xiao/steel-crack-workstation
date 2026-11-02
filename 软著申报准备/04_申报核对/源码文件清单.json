@@ -1,0 +1,115 @@
+{
+  "snapshot_date": "2026-11-02",
+  "software_name": "工业裂缝检测离线版",
+  "registration_version": "V1.0",
+  "app_version": "1.0.0",
+  "source_project_version": "2.1.0",
+  "source_commit": "12e4847c73564cef6f4570d018021eb04f57f6a5",
+  "note": "业务代码快照及完整性清单；不证明作者身份、创作日期或权属。文档为事后整理。",
+  "source_order": [
+    "app.py",
+    "industrial.py",
+    "industrial_crack/__init__.py",
+    "industrial_crack/config.py",
+    "industrial_crack/gui.py",
+    "industrial_crack/service.py",
+    "industrial_crack/storage.py",
+    "industrial_crack/review.py",
+    "industrial_crack/cli.py"
+  ],
+  "python_files": 9,
+  "python_lines_including_comments_and_blanks": 1523,
+  "files": [
+    {
+      "file": "app.py",
+      "sha256": "ef4114be3d50270e969fb0e2ea956dc937057e472d7201004f22be08853a0a08",
+      "bytes": 166,
+      "lines": 6,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "industrial.py",
+      "sha256": "c63ced4274a44096b62b6b12b8a4677935e7775b97e1f51b21023f35330416c3",
+      "bytes": 166,
+      "lines": 6,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "industrial_crack/__init__.py",
+      "sha256": "1130cd51618d23a4bfb1e7de3e5d605e0f1d8692b4b2ea21ab131da56a24b4ef",
+      "bytes": 81,
+      "lines": 3,
+      "relation": "申报版内部版本号改为 1.0.0；原项目 2.1.0 保持原样"
+    },
+    {
+      "file": "industrial_crack/config.py",
+      "sha256": "8323d0760d9e26202cf07c6921c491c8574461c11e4cbfa6ab35faa0a355119d",
+      "bytes": 3268,
+      "lines": 78,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "industrial_crack/gui.py",
+      "sha256": "920dde9045ea05db36433b1920f22aa7ade699f8368da852731ecbd662e37160",
+      "bytes": 23809,
+      "lines": 576,
+      "relation": "申报版窗口标题统一为 工业裂缝检测离线版 V1.0，并去掉不再使用的版本导入"
+    },
+    {
+      "file": "industrial_crack/service.py",
+      "sha256": "0f3d9b5ecd7b7af647c3c31bccb2e8f70d82a8304999921f215f37b4863c52ce",
+      "bytes": 11543,
+      "lines": 301,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "industrial_crack/storage.py",
+      "sha256": "424c4b2d52365d43ba8be267b22a011c4e018cd9f33db7052922a9d28e90f47d",
+      "bytes": 12716,
+      "lines": 321,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "industrial_crack/review.py",
+      "sha256": "f458d082d8cdcf6d6d2f805dcf31486e540b72c212e9603acb67f0c022744d60",
+      "bytes": 6269,
+      "lines": 135,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "industrial_crack/cli.py",
+      "sha256": "ce32824f118bc81019f6e74d92af156776e6734d045b93f40439319bda22e3d3",
+      "bytes": 4353,
+      "lines": 97,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "requirements.txt",
+      "sha256": "a31ede289884088f9f028e20291a2d4e254ebd33a05b40836bdf41c5199d2fa4",
+      "bytes": 365,
+      "lines": 10,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "LICENSE",
+      "sha256": "43493055b5d62be77a6d270d5b0f46905b93e63bdfe7aad7781f336a79df01df",
+      "bytes": 1082,
+      "lines": 21,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "THIRD_PARTY_NOTICES.md",
+      "sha256": "6f81db7cdae60f6e4074b0568fe9fded35a75d90be19442c68d92761c6ec1256",
+      "bytes": 2966,
+      "lines": 32,
+      "relation": "与项目文件逐字节相同"
+    },
+    {
+      "file": "inspection_config.json",
+      "sha256": "a9703d62bea0ee2c37d20c61a4719fa3167358a9f8776bff3b014c73c3dbc1b2",
+      "bytes": 264,
+      "lines": 13,
+      "relation": "仅修改 weights 为 weights/best.pt，适配独立目录；未附权重"
+    }
+  ]
+}
