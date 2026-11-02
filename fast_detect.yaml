@@ -1,0 +1,6 @@
+path: ./datasets/steel_crack_detect_fast
+train: images/train
+val: images/val
+nc: 1
+names:
+  0: crack

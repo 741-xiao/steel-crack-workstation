@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+inspection_data/
+verification_output/
+.backups/
+
+# Local testing and tooling
+.test_tmp*/
+.codex/
+.agents/
+*.log
+*.tmp
+
+# Datasets, model weights and generated evidence are not published
+datasets/
+image_Steelcrack*/
+runs/
+结果展示/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.sqlite3
+*.sqlite3-*
+*.db
+*.zip
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key

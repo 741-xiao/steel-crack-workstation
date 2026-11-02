@@ -1,0 +1,9 @@
+# ============ 钢结构裂纹分割数据集配置 ============
+# 图片复用自检测数据集（目录联接），标签为多边形格式
+path: ./datasets/steel_crack_seg
+train: images/train
+val: images/val
+
+nc: 1
+names:
+  0: crack
